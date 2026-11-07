@@ -46,28 +46,38 @@ async function loadAdminServices() {
         <small>${escapeAdminHTML(service.origin)}</small>
       </div>
       <button
-        data-disable="${escapeAdminHTML(service.slug)}"
-        class="danger"
-        ${service.enabled ? "" : "disabled"}
-      >${service.enabled ? "停止" : "停止中"}</button>
+        data-toggle-service="${escapeAdminHTML(service.slug)}"
+        data-enabled="${Boolean(service.enabled)}"
+        class="${service.enabled ? "danger" : "secondary"}"
+      >${service.enabled ? "停止" : "有効化"}</button>
     </article>
   `).join("");
 
-  container.querySelectorAll("[data-disable]").forEach(button => {
+  container.querySelectorAll("[data-toggle-service]").forEach(button => {
     button.addEventListener("click", async () => {
-      const slug = button.dataset.disable;
+      const slug = button.dataset.toggleService;
+      const enabled = button.dataset.enabled === "true";
 
-      if (!slug || !confirm(`${slug} を停止しますか？`)) return;
+      if (!slug) return;
+      if (enabled && !confirm(`${slug} を停止しますか？`)) return;
+
+      button.disabled = true;
 
       try {
-        await adminApi("/api/admin/services/disable", {
-          method: "POST",
-          body: JSON.stringify({ slug })
-        });
+        await adminApi(
+          enabled
+            ? "/api/admin/services/disable"
+            : "/api/admin/services/enable",
+          {
+            method: "POST",
+            body: JSON.stringify({ slug })
+          }
+        );
 
         await loadAdminServices();
       } catch (error) {
         alert(error.message);
+        button.disabled = false;
       }
     });
   });
