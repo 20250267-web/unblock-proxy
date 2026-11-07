@@ -1,0 +1,56 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proxy Admin</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/admin.js" defer></script>
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div>
+        <div class="eyebrow">ADMINISTRATION</div>
+        <h1>管理コンソール</h1>
+        <p>Private Proxy Control Panel</p>
+      </div>
+      <a href="/" class="back-link">ポータルへ戻る</a>
+    </header>
+
+    <section class="card">
+      <h2>登録サービス</h2>
+      <div id="admin-services">
+        読み込み中...
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>アクセス状況</h2>
+      <p class="notice">
+        URLやクエリ文字列を含まない基本的なアクセス記録です。
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>メンバー</th>
+              <th>サービス</th>
+              <th>方式</th>
+              <th>状態</th>
+              <th>日時</th>
+            </tr>
+          </thead>
+          <tbody id="admin-events">
+            <tr>
+              <td colspan="5">読み込み中...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
