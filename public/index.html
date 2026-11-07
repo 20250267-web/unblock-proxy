@@ -1,0 +1,104 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Private Proxy</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div>
+        <div class="eyebrow">PRIVATE NETWORK</div>
+        <h1>Private Proxy</h1>
+        <p>Member-only service portal</p>
+      </div>
+      <div id="status" class="status">接続確認中</div>
+    </header>
+
+    <section class="card">
+      <h2>アカウント情報</h2>
+      <p id="identity">認証情報を取得しています...</p>
+    </section>
+
+    <section class="card">
+      <div class="section-header">
+        <h2>利用可能なサービス</h2>
+        <button id="reload" class="secondary">更新</button>
+      </div>
+      <div id="services" class="services">
+        読み込み中...
+      </div>
+    </section>
+
+    <section id="admin" class="card hidden">
+      <h2>管理者コンソール</h2>
+
+      <h3>サービス登録</h3>
+      <form id="service-form">
+        <label>
+          サービスID
+          <input name="slug" pattern="[a-z0-9][a-z0-9-]{1,47}" required>
+        </label>
+
+        <label>
+          サービス名
+          <input name="name" maxlength="80" required>
+        </label>
+
+        <label>
+          HTTPSオリジン
+          <input name="origin" type="url"
+            placeholder="https://api.example.com" required>
+        </label>
+
+        <label>
+          許可するパス（JSON）
+          <input name="paths"
+            value='["/v1/public"]' required>
+        </label>
+
+        <button type="submit">サービスを追加</button>
+      </form>
+
+      <h3>メンバーへの利用権限付与</h3>
+      <form id="member-form">
+        <label>
+          サービスID
+          <input name="slug" required>
+        </label>
+
+        <label>
+          メールアドレス
+          <input name="email" type="email" required>
+        </label>
+
+        <button type="submit">利用権限を付与</button>
+      </form>
+
+      <p id="admin-message"></p>
+    </section>
+
+    <section class="card">
+      <h2>プライバシー</h2>
+      <p>
+        このシステムは、プロキシ側で閲覧URLや検索内容を
+        アクセスログに保存しない設計です。
+      </p>
+      <p class="notice">
+        外部サービスやブラウザ側の履歴・通信記録までは
+        制御できません。
+      </p>
+    </section>
+
+    <footer>
+      Private Proxy Portal
+    </footer>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
