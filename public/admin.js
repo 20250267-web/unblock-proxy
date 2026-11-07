@@ -1,4 +1,3 @@
-
 const adminApi = async (path, options = {}) => {
   const response = await fetch(path, {
     ...options,
@@ -29,10 +28,15 @@ const escapeAdminHTML = value =>
   })[char]);
 
 async function loadAdminServices() {
-  const services = await adminApi("/api/services");
+  const { services = [] } = await adminApi("/api/services");
   const container = document.getElementById("admin-services");
 
   if (!container) return;
+
+  if (!Array.isArray(services) || services.length === 0) {
+    container.textContent = "登録サービスはありません。";
+    return;
+  }
 
   container.innerHTML = services.map(service => `
     <article class="admin-service">
@@ -44,7 +48,8 @@ async function loadAdminServices() {
       <button
         data-disable="${escapeAdminHTML(service.slug)}"
         class="danger"
-      >停止</button>
+        ${service.enabled ? "" : "disabled"}
+      >${service.enabled ? "停止" : "停止中"}</button>
     </article>
   `).join("");
 
@@ -52,7 +57,7 @@ async function loadAdminServices() {
     button.addEventListener("click", async () => {
       const slug = button.dataset.disable;
 
-      if (!confirm(`${slug} を停止しますか？`)) return;
+      if (!slug || !confirm(`${slug} を停止しますか？`)) return;
 
       try {
         await adminApi("/api/admin/services/disable", {
@@ -69,10 +74,20 @@ async function loadAdminServices() {
 }
 
 async function loadAdminEvents() {
-  const events = await adminApi("/api/admin/events");
+  const { events = [] } = await adminApi("/api/admin/events");
   const container = document.getElementById("admin-events");
 
   if (!container) return;
+
+  if (!Array.isArray(events) || events.length === 0) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.textContent = "アクセス記録はありません。";
+    row.append(cell);
+    container.replaceChildren(row);
+    return;
+  }
 
   container.innerHTML = events.map(event => `
     <tr>
@@ -96,7 +111,7 @@ async function initializeAdmin() {
       loadAdminEvents()
     ]);
   } catch (error) {
-    console.error("Admin initialization failed");
+    console.error("Admin initialization failed", error);
   }
 }
 

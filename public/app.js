@@ -1,4 +1,3 @@
-
 const $ = id => document.getElementById(id);
 
 async function api(path, options = {}) {
@@ -43,9 +42,9 @@ async function load() {
     $("status").textContent = "認証済み";
     $("admin").classList.toggle("hidden", !me.admin);
 
-    const services = await api("/api/services");
+    const { services = [] } = await api("/api/services");
 
-    if (!services.length) {
+    if (!Array.isArray(services) || services.length === 0) {
       $("services").textContent =
         "利用可能なサービスはありません。";
       return;
@@ -78,8 +77,8 @@ $("reload").addEventListener("click", load);
 
 $("service-form").addEventListener("submit", async event => {
   event.preventDefault();
-
-  const form = new FormData(event.currentTarget);
+  const formElement = event.currentTarget;
+  const form = new FormData(formElement);
 
   try {
     const paths = JSON.parse(form.get("paths"));
@@ -97,7 +96,7 @@ $("service-form").addEventListener("submit", async event => {
     $("admin-message").textContent =
       "サービスを登録しました。";
 
-    event.currentTarget.reset();
+    formElement.reset();
     await load();
 
   } catch (error) {
@@ -107,8 +106,8 @@ $("service-form").addEventListener("submit", async event => {
 
 $("member-form").addEventListener("submit", async event => {
   event.preventDefault();
-
-  const form = new FormData(event.currentTarget);
+  const formElement = event.currentTarget;
+  const form = new FormData(formElement);
 
   try {
     await api("/api/admin/members", {
@@ -122,7 +121,7 @@ $("member-form").addEventListener("submit", async event => {
     $("admin-message").textContent =
       "メンバーに利用権限を付与しました。";
 
-    event.currentTarget.reset();
+    formElement.reset();
 
   } catch (error) {
     $("admin-message").textContent = error.message;
