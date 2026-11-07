@@ -10,8 +10,9 @@ binding = "ASSETS"
 [[d1_databases]]
 binding = "DB"
 database_name = "private-proxy-db"
-database_id = "ここにD1のID"
+database_id = "YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
 
 [vars]
-ACCESS_TEAM_DOMAIN = "ここにCloudflareのチームドメイン"
-ACCESS_AUD = "ここにAccessのAUD"
+ACCESS_TEAM_DOMAIN = "YOUR_TEAM.cloudflareaccess.com"
+ACCESS_AUD = "YOUR_ACCESS_APPLICATION_AUD"
