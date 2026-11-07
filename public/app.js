@@ -4,9 +4,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
     headers: {
-      ...(options.body
-        ? { "Content-Type": "application/json" }
-        : {}),
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
       ...(options.headers || {})
     }
   });
@@ -14,16 +12,14 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(
-      data.error || `HTTP ${response.status}`
-    );
+    throw new Error(data.error || `HTTP ${response.status}`);
   }
 
   return data;
 }
 
 function escapeHTML(value) {
-  return String(value).replace(/[&<>"']/g, char => ({
+  return String(value).replace(/[&<>\"']/g, char => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -45,8 +41,7 @@ async function load() {
     const { services = [] } = await api("/api/services");
 
     if (!Array.isArray(services) || services.length === 0) {
-      $("services").textContent =
-        "利用可能なサービスはありません。";
+      $("services").textContent = "利用可能なサービスはありません。";
       return;
     }
 
@@ -64,12 +59,10 @@ async function load() {
         </p>
       </article>
     `).join("");
-
   } catch (error) {
     $("status").textContent = "認証エラー";
     $("identity").textContent = error.message;
-    $("services").textContent =
-      "Cloudflare Accessの設定を確認してください。";
+    $("services").textContent = "Cloudflare Accessの設定を確認してください。";
   }
 }
 
@@ -77,6 +70,7 @@ $("reload").addEventListener("click", load);
 
 $("service-form").addEventListener("submit", async event => {
   event.preventDefault();
+
   const formElement = event.currentTarget;
   const form = new FormData(formElement);
 
@@ -93,12 +87,9 @@ $("service-form").addEventListener("submit", async event => {
       })
     });
 
-    $("admin-message").textContent =
-      "サービスを登録しました。";
-
+    $("admin-message").textContent = "サービスを登録しました。";
     formElement.reset();
     await load();
-
   } catch (error) {
     $("admin-message").textContent = error.message;
   }
@@ -106,6 +97,7 @@ $("service-form").addEventListener("submit", async event => {
 
 $("member-form").addEventListener("submit", async event => {
   event.preventDefault();
+
   const formElement = event.currentTarget;
   const form = new FormData(formElement);
 
@@ -118,11 +110,8 @@ $("member-form").addEventListener("submit", async event => {
       })
     });
 
-    $("admin-message").textContent =
-      "メンバーに利用権限を付与しました。";
-
+    $("admin-message").textContent = "メンバーに利用権限を付与しました。";
     formElement.reset();
-
   } catch (error) {
     $("admin-message").textContent = error.message;
   }
