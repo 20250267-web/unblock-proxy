@@ -1,0 +1,17 @@
+
+name = "private-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-11-07"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "private-proxy-db"
+database_id = "ここにD1のID"
+
+[vars]
+ACCESS_TEAM_DOMAIN = "ここにCloudflareのチームドメイン"
+ACCESS_AUD = "ここにAccessのAUD"
