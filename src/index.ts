@@ -1,28 +1,16 @@
+// ============================================================
+// Private Proxy
+// File: src/index.ts
+// Cloudflare Workers + Cloudflare Access + D1
+// ============================================================
 
-import {
-  createRemoteJWKSet,
-  jwtVerify
-} from "jose";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { createStreamingResponse } from "./streaming";
+import { relayWebSocket } from "./websocket";
 
-import {
-  validateOrigin,
-  validateServiceSlug,
-  validateAllowedPaths,
-  normalizeServicePath,
-  pathAllowed
-} from "./security";
-
-import {
-  createStreamingResponse
-} from "./streaming";
-
-import {
-  writeAccessLog
-} from "./logger";
-
-import {
-  relayWebSocket
-} from "./websocket";
+// ------------------------------------------------------------
+// Types
+// ------------------------------------------------------------
 
 interface Env {
   DB: D1Database;
@@ -31,122 +19,341 @@ interface Env {
   ACCESS_TEAM_DOMAIN: string;
   ACCESS_AUD: string;
 
-  // Set with: npx wrangler secret put ADMIN_EMAILS
   ADMIN_EMAILS: string;
 }
 
-interface Service {
+interface ServiceRow {
   id: number;
   slug: string;
   name: string;
   origin: string;
   allowed_paths: string;
   enabled: number;
+  created_at: string;
 }
 
-interface Identity {
+interface AccessIdentity {
   email: string;
 }
 
-const jwksCache = new Map<
-  string,
-  ReturnType<typeof createRemoteJWKSet>
->();
+interface ApiError {
+  error: string;
+}
 
-const MAX_JSON_BYTES = 32 * 1024;
-const MAX_REQUEST_BYTES = 1024 * 1024;
+// ------------------------------------------------------------
+// Constants
+// ------------------------------------------------------------
+
+const MAX_JSON_BODY = 64 * 1024;
+const MAX_PROXY_BODY = 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 20_000;
+
+const RESPONSE_HEADERS = [
+  "content-type",
+  "content-length",
+  "content-range",
+  "accept-ranges",
+  "last-modified",
+  "etag",
+];
+
+const REQUEST_HEADERS = [
+  "accept",
+  "accept-language",
+  "content-type",
+  "range",
+  "if-range",
+  "if-none-match",
+  "if-modified-since",
+];
+
+// ------------------------------------------------------------
+// Response helpers
+// ------------------------------------------------------------
 
 function json(
   data: unknown,
   status = 200,
-  extraHeaders?: HeadersInit
+  extraHeaders?: HeadersInit,
 ): Response {
   const headers = new Headers(extraHeaders);
 
-  headers.set(
-    "Content-Type",
-    "application/json; charset=utf-8"
-  );
+  headers.set("Content-Type", "application/json; charset=utf-8");
   headers.set("Cache-Control", "no-store");
   headers.set("X-Content-Type-Options", "nosniff");
 
   return new Response(JSON.stringify(data), {
     status,
-    headers
+    headers,
   });
 }
 
-function getIssuer(env: Env): string {
-  const domain = env.ACCESS_TEAM_DOMAIN
-    .trim()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/+$/, "");
-
-  if (!domain || domain.includes("/")) {
-    throw new Error("INVALID_ACCESS_DOMAIN");
-  }
-
-  return `https://${domain}`;
+function error(message: string, status = 400): Response {
+  return json({ error: message } satisfies ApiError, status);
 }
 
-async function authenticate(
-  request: Request,
-  env: Env
-): Promise<Identity> {
-  const token = request.headers.get(
-    "Cf-Access-Jwt-Assertion"
-  );
+function notFound(): Response {
+  return error("Not found", 404);
+}
 
-  if (!token) {
-    throw new Error("UNAUTHORIZED");
+function methodNotAllowed(): Response {
+  return error("Method not allowed", 405, {
+    Allow: "GET, HEAD, POST",
+  });
+}
+
+// ------------------------------------------------------------
+// Basic validation
+// ------------------------------------------------------------
+
+function normalizeEmail(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+
+  const email = value.trim().toLowerCase();
+
+  if (email.length < 3 || email.length > 254) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return null;
+
+  return email;
+}
+
+function validateSlug(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+
+  const slug = value.trim().toLowerCase();
+
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(slug)) {
+    return null;
   }
 
-  const issuer = getIssuer(env);
+  return slug;
+}
 
-  let jwks = jwksCache.get(issuer);
+function validateServiceName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
 
-  if (!jwks) {
-    jwks = createRemoteJWKSet(
-      new URL(`${issuer}/cdn-cgi/access/certs`)
+  const name = value.trim();
+
+  if (name.length < 1 || name.length > 80) return null;
+  if (/[\u0000-\u001f\u007f]/.test(name)) return null;
+
+  return name;
+}
+
+function validateOrigin(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+
+  let url: URL;
+
+  try {
+    url = new URL(value.trim());
+  } catch {
+    return null;
+  }
+
+  if (url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;
+  if (url.port && url.port !== "443") return null;
+  if (url.pathname !== "/" || url.search || url.hash) return null;
+
+  const hostname = url.hostname.toLowerCase();
+
+  if (!hostname.includes(".")) return null;
+  if (hostname === "localhost") return null;
+  if (hostname.endsWith(".localhost")) return null;
+  if (hostname.endsWith(".local")) return null;
+  if (hostname.endsWith(".internal")) return null;
+  if (hostname.endsWith(".test")) return null;
+  if (hostname === "metadata.google.internal") return null;
+
+  // IP literals are not accepted as service origins.
+  if (
+    /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) ||
+    hostname.startsWith("[")
+  ) {
+    return null;
+  }
+
+  return url.origin;
+}
+
+function validateAllowedPaths(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  if (value.length < 1 || value.length > 20) return null;
+
+  const result: string[] = [];
+
+  for (const item of value) {
+    if (typeof item !== "string") return null;
+
+    const path = item.trim();
+
+    if (!path.startsWith("/")) return null;
+    if (path.length > 160) return null;
+    if (path.includes("\\") || path.includes("\0")) return null;
+
+    let decoded: string;
+
+    try {
+      decoded = decodeURIComponent(path);
+    } catch {
+      return null;
+    }
+
+    if (decoded.includes("\0") || decoded.includes("\\")) {
+      return null;
+    }
+
+    const segments = decoded.split("/");
+
+    if (segments.some((segment) => segment === "." || segment === "..")) {
+      return null;
+    }
+
+    result.push(path);
+  }
+
+  return [...new Set(result)];
+}
+
+function normalizeProxyPath(value: string): string | null {
+  if (!value.startsWith("/")) return null;
+  if (value.length > 2048) return null;
+  if (value.includes("\\") || value.includes("\0")) return null;
+
+  let decoded: string;
+
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+
+  if (decoded.includes("\\") || decoded.includes("\0")) {
+    return null;
+  }
+
+  const segments = decoded.split("/");
+
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    return null;
+  }
+
+  return value;
+}
+
+function pathIsAllowed(
+  requestedPath: string,
+  allowedPaths: string[],
+): boolean {
+  return allowedPaths.some((allowed) => {
+    if (allowed === "/") return true;
+
+    const normalized = allowed.endsWith("/")
+      ? allowed.slice(0, -1)
+      : allowed;
+
+    return (
+      requestedPath === normalized ||
+      requestedPath.startsWith(`${normalized}/`)
     );
-
-    jwksCache.set(issuer, jwks);
-  }
-
-  const verified = await jwtVerify(token, jwks, {
-    issuer,
-    audience: env.ACCESS_AUD
   });
+}
 
-  const email = verified.payload.email;
+// ------------------------------------------------------------
+// Request body helpers
+// ------------------------------------------------------------
+
+async function readLimitedBody(
+  request: Request,
+  limit: number,
+): Promise<ArrayBuffer | null> {
+  if (!request.body) return new ArrayBuffer(0);
+
+  const declaredLength = Number(request.headers.get("content-length"));
 
   if (
-    typeof email !== "string" ||
-    email.length > 254 ||
-    !email.includes("@")
+    Number.isFinite(declaredLength) &&
+    declaredLength > limit
   ) {
-    throw new Error("INVALID_IDENTITY");
+    return null;
   }
 
-  return {
-    email: email.toLowerCase()
-  };
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+      if (!value) continue;
+
+      total += value.byteLength;
+
+      if (total > limit) {
+        await reader.cancel();
+        return null;
+      }
+
+      chunks.push(value);
+    }
+  } catch {
+    return null;
+  }
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return combined.buffer;
 }
 
-function isAdmin(email: string, env: Env): boolean {
-  const admins = (env.ADMIN_EMAILS || "")
-    .split(",")
-    .map(value => value.trim().toLowerCase())
-    .filter(Boolean);
+async function readJson(
+  request: Request,
+): Promise<Record<string, unknown> | null> {
+  const contentType = request.headers.get("content-type") || "";
 
-  return admins.includes(email.toLowerCase());
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return null;
+  }
+
+  const body = await readLimitedBody(request, MAX_JSON_BODY);
+
+  if (!body) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(
+      new TextDecoder().decode(body),
+    );
+
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      return null;
+    }
+
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
-function sameOrigin(request: Request): boolean {
-  const origin = request.headers.get("Origin");
+// ------------------------------------------------------------
+// Same-origin protection for state-changing requests
+// ------------------------------------------------------------
 
-  // Non-browser clients may omit Origin.
-  if (!origin) return true;
+function isSameOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+
+  if (!origin) return false;
 
   try {
     return new URL(origin).origin === new URL(request.url).origin;
@@ -155,598 +362,828 @@ function sameOrigin(request: Request): boolean {
   }
 }
 
-async function readJson(
-  request: Request
-): Promise<any | null> {
-  const contentType = request.headers.get("Content-Type") || "";
+// ------------------------------------------------------------
+// Cloudflare Access authentication
+// ------------------------------------------------------------
 
-  if (!contentType.toLowerCase().includes("application/json")) {
-    return null;
-  }
+function getAccessIssuer(env: Env): string | null {
+  const domain = env.ACCESS_TEAM_DOMAIN
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
 
-  const length = Number(
-    request.headers.get("Content-Length") || 0
-  );
+  if (!domain || domain.includes("/")) return null;
 
-  if (length > MAX_JSON_BYTES) {
-    return null;
-  }
+  return `https://${domain}`;
+}
+
+async function authenticate(
+  request: Request,
+  env: Env,
+): Promise<AccessIdentity | null> {
+  const assertion = request.headers.get("Cf-Access-Jwt-Assertion");
+
+  if (!assertion) return null;
+  if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) return null;
+
+  const issuer = getAccessIssuer(env);
+
+  if (!issuer) return null;
 
   try {
-    const buffer = await request.arrayBuffer();
-
-    if (buffer.byteLength > MAX_JSON_BYTES) {
-      return null;
-    }
-
-    return JSON.parse(
-      new TextDecoder().decode(buffer)
+    const jwks = createRemoteJWKSet(
+      new URL(`${issuer}/cdn-cgi/access/certs`),
     );
+
+    const { payload } = await jwtVerify(assertion, jwks, {
+      issuer,
+      audience: env.ACCESS_AUD,
+    });
+
+    const email = normalizeEmail(payload.email);
+
+    if (!email) return null;
+
+    return { email };
   } catch {
     return null;
   }
 }
+
+function isAdmin(email: string, env: Env): boolean {
+  const admins = (env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((item) => normalizeEmail(item))
+    .filter((item): item is string => item !== null);
+
+  return admins.includes(email);
+}
+
+async function requireAdmin(
+  identity: AccessIdentity,
+  env: Env,
+): Promise<boolean> {
+  return isAdmin(identity.email, env);
+}
+
+// ------------------------------------------------------------
+// Database helpers
+// ------------------------------------------------------------
 
 async function findService(
   env: Env,
   slug: string,
-  email: string,
-  admin: boolean
-): Promise<Service | null> {
-  const query = admin
-    ? `
-      SELECT *
-      FROM services
-      WHERE slug = ?
-        AND enabled = 1
-      LIMIT 1
-    `
-    : `
-      SELECT s.*
-      FROM services s
-      INNER JOIN service_members m
-        ON m.service_id = s.id
-      WHERE s.slug = ?
-        AND s.enabled = 1
-        AND m.email = ?
-      LIMIT 1
-    `;
-
-  const statement = admin
-    ? env.DB.prepare(query).bind(slug)
-    : env.DB.prepare(query).bind(slug, email);
-
-  return statement.first<Service>();
+): Promise<ServiceRow | null> {
+  return env.DB.prepare(
+    `SELECT id, slug, name, origin, allowed_paths, enabled, created_at
+     FROM services
+     WHERE slug = ?
+     LIMIT 1`,
+  )
+    .bind(slug)
+    .first<ServiceRow>();
 }
 
-async function listServices(
+async function isServiceMember(
   env: Env,
+  serviceId: number,
   email: string,
-  admin: boolean
-): Promise<unknown[]> {
-  const statement = admin
-    ? env.DB.prepare(`
-        SELECT id, slug, name, origin, enabled
-        FROM services
-        ORDER BY name
-      `)
-    : env.DB.prepare(`
-        SELECT s.id, s.slug, s.name, s.origin, s.enabled
-        FROM services s
-        INNER JOIN service_members m
-          ON m.service_id = s.id
-        WHERE m.email = ?
-          AND s.enabled = 1
-        ORDER BY s.name
-      `).bind(email);
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS allowed
+     FROM service_members
+     WHERE service_id = ? AND email = ?
+     LIMIT 1`,
+  )
+    .bind(serviceId, email)
+    .first<{ allowed: number }>();
 
-  const result = await statement.all();
-
-  return result.results || [];
+  return Boolean(row);
 }
 
-async function getAllowedPaths(
-  service: Service
-): Promise<string[] | null> {
+async function canUseService(
+  env: Env,
+  service: ServiceRow,
+  identity: AccessIdentity,
+): Promise<boolean> {
+  if (!service.enabled) return false;
+
+  if (isAdmin(identity.email, env)) {
+    return true;
+  }
+
+  return isServiceMember(env, service.id, identity.email);
+}
+
+function parseAllowedPaths(value: string): string[] | null {
   try {
-    const paths = JSON.parse(service.allowed_paths);
+    const parsed: unknown = JSON.parse(value);
 
-    if (!validateAllowedPaths(paths)) {
-      return null;
-    }
-
-    return paths;
+    return validateAllowedPaths(parsed);
   } catch {
     return null;
   }
 }
 
-async function adminApi(
-  request: Request,
+async function listServices(
   env: Env,
-  pathname: string
-): Promise<Response> {
-  if (!sameOrigin(request)) {
-    return json({ error: "Invalid origin" }, 403);
+  identity: AccessIdentity,
+): Promise<ServiceRow[]> {
+  if (isAdmin(identity.email, env)) {
+    const result = await env.DB.prepare(
+      `SELECT id, slug, name, origin, allowed_paths, enabled, created_at
+       FROM services
+       ORDER BY name COLLATE NOCASE ASC`,
+    ).all<ServiceRow>();
+
+    return result.results || [];
   }
 
-  if (
-    request.method === "POST" &&
-    pathname === "/api/admin/services"
-  ) {
-    const body = await readJson(request);
+  const result = await env.DB.prepare(
+    `SELECT
+       s.id,
+       s.slug,
+       s.name,
+       s.origin,
+       s.allowed_paths,
+       s.enabled,
+       s.created_at
+     FROM services s
+     INNER JOIN service_members sm ON sm.service_id = s.id
+     WHERE sm.email = ? AND s.enabled = 1
+     ORDER BY s.name COLLATE NOCASE ASC`,
+  )
+    .bind(identity.email)
+    .all<ServiceRow>();
 
-    if (!body) {
-      return json({ error: "Invalid JSON body" }, 400);
-    }
+  return result.results || [];
+}
 
-    const slug = String(body.slug || "").trim();
-    const name = String(body.name || "").trim();
-    const origin = validateOrigin(
-      String(body.origin || "")
-    );
-    const paths = body.allowedPaths;
+// ------------------------------------------------------------
+// Access event logging
+// No full URLs, query strings, or request bodies are stored.
+// ------------------------------------------------------------
 
-    if (!validateServiceSlug(slug)) {
-      return json({ error: "Invalid service slug" }, 400);
-    }
+async function logAccess(
+  env: Env,
+  email: string,
+  slug: string,
+  method: string,
+  status: number,
+): Promise<void> {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO access_events
+       (email, service_slug, method, status)
+       VALUES (?, ?, ?, ?)`,
+    )
+      .bind(email, slug, method, status)
+      .run();
+  } catch {
+    // Logging failure must not break the actual request.
+  }
+}
 
-    if (!name || name.length > 80) {
-      return json({ error: "Invalid service name" }, 400);
-    }
+// ------------------------------------------------------------
+// Admin API
+// ------------------------------------------------------------
 
-    if (!origin) {
-      return json({ error: "Invalid HTTPS origin" }, 400);
-    }
+async function adminCreateService(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await readJson(request);
 
-    if (!validateAllowedPaths(paths)) {
-      return json({ error: "Invalid allowed paths" }, 400);
-    }
+  if (!body) return error("Invalid JSON request", 400);
 
-    try {
-      await env.DB.prepare(`
-        INSERT INTO services
-          (slug, name, origin, allowed_paths, enabled)
-        VALUES (?, ?, ?, ?, 1)
-      `).bind(
+  const slug = validateSlug(body.slug);
+  const name = validateServiceName(body.name);
+  const origin = validateOrigin(body.origin);
+  const allowedPaths = validateAllowedPaths(
+    body.allowedPaths ?? ["/"],
+  );
+
+  if (!slug) return error("Invalid service slug");
+  if (!name) return error("Invalid service name");
+  if (!origin) return error("Invalid HTTPS service origin");
+  if (!allowedPaths) return error("Invalid allowed paths");
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO services
+       (slug, name, origin, allowed_paths, enabled)
+       VALUES (?, ?, ?, ?, 1)`,
+    )
+      .bind(
         slug,
         name,
-        origin.origin,
-        JSON.stringify(paths)
-      ).run();
-
-      return json({ ok: true }, 201);
-    } catch {
-      return json({
-        error: "Service already exists or database error"
-      }, 409);
-    }
-  }
-
-  if (
-    request.method === "POST" &&
-    pathname === "/api/admin/members"
-  ) {
-    const body = await readJson(request);
-
-    if (!body) {
-      return json({ error: "Invalid JSON body" }, 400);
-    }
-
-    const slug = String(body.slug || "").trim();
-    const email = String(body.email || "")
-      .trim()
-      .toLowerCase();
-
-    if (
-      email.length > 254 ||
-      !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)
-    ) {
-      return json({ error: "Invalid email" }, 400);
-    }
-
-    const service = await env.DB.prepare(`
-      SELECT id
-      FROM services
-      WHERE slug = ?
-      LIMIT 1
-    `).bind(slug).first<{ id: number }>();
-
-    if (!service) {
-      return json({ error: "Service not found" }, 404);
-    }
-
-    await env.DB.prepare(`
-      INSERT OR IGNORE INTO service_members
-        (service_id, email)
-      VALUES (?, ?)
-    `).bind(service.id, email).run();
-
-    return json({ ok: true }, 201);
-  }
-
-  if (
-    request.method === "POST" &&
-    pathname === "/api/admin/services/disable"
-  ) {
-    const body = await readJson(request);
-
-    if (!body || typeof body.slug !== "string") {
-      return json({ error: "Invalid request" }, 400);
-    }
-
-    const result = await env.DB.prepare(`
-      UPDATE services
-      SET enabled = 0
-      WHERE slug = ?
-    `).bind(body.slug).run();
+        origin,
+        JSON.stringify(allowedPaths),
+      )
+      .run();
 
     return json({
-      ok: true,
-      changed: result.meta.changes || 0
-    });
+      success: true,
+      message: "Service created",
+      slug,
+    }, 201);
+  } catch {
+    return error("Could not create service. The slug may already exist.", 409);
   }
-
-  if (
-    request.method === "POST" &&
-    pathname === "/api/admin/members/remove"
-  ) {
-    const body = await readJson(request);
-
-    if (
-      !body ||
-      typeof body.slug !== "string" ||
-      typeof body.email !== "string"
-    ) {
-      return json({ error: "Invalid request" }, 400);
-    }
-
-    const service = await env.DB.prepare(`
-      SELECT id
-      FROM services
-      WHERE slug = ?
-    `).bind(body.slug).first<{ id: number }>();
-
-    if (!service) {
-      return json({ error: "Service not found" }, 404);
-    }
-
-    await env.DB.prepare(`
-      DELETE FROM service_members
-      WHERE service_id = ?
-        AND email = ?
-    `).bind(
-      service.id,
-      body.email.toLowerCase()
-    ).run();
-
-    return json({ ok: true });
-  }
-
-  if (
-    request.method === "GET" &&
-    pathname === "/api/admin/events"
-  ) {
-    const result = await env.DB.prepare(`
-      SELECT email, service_slug, method, status, created_at
-      FROM access_events
-      ORDER BY id DESC
-      LIMIT 100
-    `).all();
-
-    return json(result.results || []);
-  }
-
-  return json({ error: "Not found" }, 404);
 }
 
-function buildUpstreamUrl(
-  origin: string,
-  path: string,
-  search: string
-): URL | null {
-  const base = validateOrigin(origin);
-
-  if (!base) return null;
-
-  const normalized = normalizeServicePath(path);
-
-  if (!normalized) return null;
-
-  const target = new URL(base.origin);
-
-  target.pathname = normalized;
-  target.search = search;
-
-  return target;
-}
-
-async function relayApi(
+async function adminAddMember(
   request: Request,
   env: Env,
-  identity: Identity,
-  admin: boolean,
-  slug: string,
-  rest: string
 ): Promise<Response> {
-  const method = request.method;
+  const body = await readJson(request);
 
-  if (!["GET", "HEAD", "POST"].includes(method)) {
-    return json({ error: "Method not allowed" }, 405, {
-      Allow: "GET, HEAD, POST"
-    });
+  if (!body) return error("Invalid JSON request", 400);
+
+  const slug = validateSlug(body.slug);
+  const email = normalizeEmail(body.email);
+
+  if (!slug) return error("Invalid service slug");
+  if (!email) return error("Invalid email address");
+
+  const service = await findService(env, slug);
+
+  if (!service) return error("Service not found", 404);
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO service_members (service_id, email)
+       VALUES (?, ?)`,
+    )
+      .bind(service.id, email)
+      .run();
+
+    return json({
+      success: true,
+      message: "Member added",
+      slug,
+      email,
+    }, 201);
+  } catch {
+    return error("Member is already registered or could not be added.", 409);
+  }
+}
+
+async function adminRemoveMember(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await readJson(request);
+
+  if (!body) return error("Invalid JSON request", 400);
+
+  const slug = validateSlug(body.slug);
+  const email = normalizeEmail(body.email);
+
+  if (!slug) return error("Invalid service slug");
+  if (!email) return error("Invalid email address");
+
+  const service = await findService(env, slug);
+
+  if (!service) return error("Service not found", 404);
+
+  const result = await env.DB.prepare(
+    `DELETE FROM service_members
+     WHERE service_id = ? AND email = ?`,
+  )
+    .bind(service.id, email)
+    .run();
+
+  return json({
+    success: true,
+    removed: result.meta.changes > 0,
+  });
+}
+
+async function adminDisableService(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await readJson(request);
+
+  if (!body) return error("Invalid JSON request", 400);
+
+  const slug = validateSlug(body.slug);
+
+  if (!slug) return error("Invalid service slug");
+
+  const result = await env.DB.prepare(
+    `UPDATE services
+     SET enabled = 0
+     WHERE slug = ?`,
+  )
+    .bind(slug)
+    .run();
+
+  if (result.meta.changes === 0) {
+    return error("Service not found", 404);
   }
 
-  if (method === "POST" && !sameOrigin(request)) {
-    return json({ error: "Invalid origin" }, 403);
-  }
-
-  const service = await findService(
-    env,
+  return json({
+    success: true,
+    message: "Service disabled",
     slug,
-    identity.email,
-    admin
-  );
+  });
+}
 
-  if (!service) {
-    return json({ error: "Service unavailable" }, 404);
+async function adminEnableService(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  const body = await readJson(request);
+
+  if (!body) return error("Invalid JSON request", 400);
+
+  const slug = validateSlug(body.slug);
+
+  if (!slug) return error("Invalid service slug");
+
+  const result = await env.DB.prepare(
+    `UPDATE services
+     SET enabled = 1
+     WHERE slug = ?`,
+  )
+    .bind(slug)
+    .run();
+
+  if (result.meta.changes === 0) {
+    return error("Service not found", 404);
   }
 
-  const prefixes = await getAllowedPaths(service);
+  return json({
+    success: true,
+    message: "Service enabled",
+    slug,
+  });
+}
 
-  if (!prefixes) {
-    return json({ error: "Invalid service configuration" }, 500);
+async function adminListMembers(
+  url: URL,
+  env: Env,
+): Promise<Response> {
+  const slug = validateSlug(url.searchParams.get("slug"));
+
+  if (!slug) return error("A valid service slug is required");
+
+  const service = await findService(env, slug);
+
+  if (!service) return error("Service not found", 404);
+
+  const result = await env.DB.prepare(
+    `SELECT email
+     FROM service_members
+     WHERE service_id = ?
+     ORDER BY email COLLATE NOCASE ASC`,
+  )
+    .bind(service.id)
+    .all<{ email: string }>();
+
+  return json({
+    service: {
+      slug: service.slug,
+      name: service.name,
+    },
+    members: result.results || [],
+  });
+}
+
+async function adminListEvents(
+  url: URL,
+  env: Env,
+): Promise<Response> {
+  const requestedLimit = Number(url.searchParams.get("limit") || "50");
+
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(Math.floor(requestedLimit), 1), 200)
+    : 50;
+
+  const result = await env.DB.prepare(
+    `SELECT email, service_slug, method, status, created_at
+     FROM access_events
+     ORDER BY id DESC
+     LIMIT ?`,
+  )
+    .bind(limit)
+    .all<{
+      email: string;
+      service_slug: string;
+      method: string;
+      status: number;
+      created_at: string;
+    }>();
+
+  return json({
+    events: result.results || [],
+  });
+}
+
+// ------------------------------------------------------------
+// Proxy request handling
+// ------------------------------------------------------------
+
+function getProxyRoute(pathname: string): {
+  slug: string;
+  servicePath: string;
+} | null {
+  const prefix = "/api/relay/";
+
+  if (!pathname.startsWith(prefix)) return null;
+
+  const remainder = pathname.slice(prefix.length);
+  const slashIndex = remainder.indexOf("/");
+
+  if (slashIndex <= 0) {
+    return {
+      slug: remainder,
+      servicePath: "/",
+    };
   }
 
-  const path = normalizeServicePath("/" + rest);
+  return {
+    slug: remainder.slice(0, slashIndex),
+    servicePath: remainder.slice(slashIndex),
+  };
+}
 
-  if (!path || !pathAllowed(path, prefixes)) {
-    return json({ error: "Path not allowed" }, 403);
+function buildUpstreamHeaders(request: Request): Headers {
+  const headers = new Headers();
+
+  for (const name of REQUEST_HEADERS) {
+    const value = request.headers.get(name);
+
+    if (value) {
+      headers.set(name, value);
+    }
   }
 
-  const target = buildUpstreamUrl(
-    service.origin,
-    path,
-    new URL(request.url).search
-  );
+  // Do not forward the visitor's cookies or Cloudflare Access JWT.
+  // Upstream authentication should be configured separately for
+  // each approved service when required.
 
-  if (!target) {
-    return json({ error: "Invalid upstream URL" }, 400);
+  return headers;
+}
+
+async function relayHttp(
+  request: Request,
+  env: Env,
+  identity: AccessIdentity,
+  service: ServiceRow,
+  servicePath: string,
+): Promise<Response> {
+  if (!["GET", "HEAD", "POST"].includes(request.method)) {
+    return methodNotAllowed();
   }
+
+  const normalizedPath = normalizeProxyPath(servicePath);
+
+  if (!normalizedPath) {
+    return error("Invalid service path", 400);
+  }
+
+  const allowedPaths = parseAllowedPaths(service.allowed_paths);
+
+  if (!allowedPaths) {
+    return error("Service path configuration is invalid", 500);
+  }
+
+  if (!pathIsAllowed(normalizedPath, allowedPaths)) {
+    return error("This path is not allowed for this service", 403);
+  }
+
+  const origin = validateOrigin(service.origin);
+
+  if (!origin) {
+    return error("Service origin configuration is invalid", 500);
+  }
+
+  const upstreamUrl = new URL(origin);
+
+  upstreamUrl.pathname =
+    normalizedPath === "/" ? "/" : normalizedPath;
+
+  // Preserve the query string for the registered service.
+  upstreamUrl.search = new URL(request.url).search;
+
+  const headers = buildUpstreamHeaders(request);
 
   let body: ArrayBuffer | undefined;
 
-  if (method === "POST") {
-    const declaredLength = Number(
-      request.headers.get("Content-Length") || 0
+  if (request.method === "POST") {
+    const contentLength = Number(
+      request.headers.get("content-length") || "0",
     );
 
-    if (declaredLength > MAX_REQUEST_BYTES) {
-      return json({ error: "Request too large" }, 413);
+    if (
+      Number.isFinite(contentLength) &&
+      contentLength > MAX_PROXY_BODY
+    ) {
+      return error("Request body is too large", 413);
     }
 
-    try {
-      body = await request.arrayBuffer();
-    } catch {
-      return json({ error: "Unable to read request" }, 400);
+    const limitedBody = await readLimitedBody(
+      request,
+      MAX_PROXY_BODY,
+    );
+
+    if (!limitedBody) {
+      return error("Request body is too large or invalid", 413);
     }
 
-    if (body.byteLength > MAX_REQUEST_BYTES) {
-      return json({ error: "Request too large" }, 413);
-    }
+    body = limitedBody;
   }
 
-  const headers = new Headers();
-
-  const contentType = request.headers.get("Content-Type");
-  if (contentType) {
-    headers.set("Content-Type", contentType);
-  }
-
-  const accept = request.headers.get("Accept");
-  if (accept) {
-    headers.set("Accept", accept);
-  }
-
-  const range = request.headers.get("Range");
-  if (range && method !== "POST") {
-    headers.set("Range", range);
-  }
-
-  headers.set("User-Agent", "PrivateProxyGateway/1.0");
-
-  let upstream: Response;
+  let upstreamResponse: Response;
 
   try {
-    upstream = await fetch(target.toString(), {
-      method,
+    upstreamResponse = await fetch(upstreamUrl.toString(), {
+      method: request.method,
       headers,
       body,
       redirect: "manual",
-      signal: AbortSignal.timeout(20000)
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch {
-    await writeAccessLog(env.DB, {
-      email: identity.email,
-      serviceSlug: slug,
-      method,
-      status: 502
-    });
+    await logAccess(
+      env,
+      identity.email,
+      service.slug,
+      request.method,
+      502,
+    );
 
-    return json({ error: "Upstream request failed" }, 502);
+    return error("The registered service could not be reached", 502);
   }
 
-  // Do not automatically follow redirects. A redirect could
-  // send the request to an unapproved destination.
-  if (upstream.status >= 300 && upstream.status < 400) {
-    await writeAccessLog(env.DB, {
-      email: identity.email,
-      serviceSlug: slug,
-      method,
-      status: 502
-    });
+  // Do not relay redirects to arbitrary destinations.
+  if (
+    upstreamResponse.status >= 300 &&
+    upstreamResponse.status < 400
+  ) {
+    await logAccess(
+      env,
+      identity.email,
+      service.slug,
+      request.method,
+      502,
+    );
 
-    return json({
-      error: "Upstream redirect blocked"
-    }, 502);
+    return error(
+      "The upstream service returned a redirect. Open the approved service directly if appropriate.",
+      502,
+    );
   }
 
-  await writeAccessLog(env.DB, {
-    email: identity.email,
-    serviceSlug: slug,
-    method,
-    status: upstream.status
-  });
-
-  return createStreamingResponse(upstream, {
+  const response = createStreamingResponse(upstreamResponse, {
     allowRange: true,
-    cache: false
+    cache: false,
   });
+
+  await logAccess(
+    env,
+    identity.email,
+    service.slug,
+    request.method,
+    response.status,
+  );
+
+  return response;
 }
 
-async function relayWs(
+// ------------------------------------------------------------
+// API router
+// ------------------------------------------------------------
+
+async function handleApi(
   request: Request,
   env: Env,
-  identity: Identity,
-  admin: boolean,
-  slug: string,
-  rest: string
+  identity: AccessIdentity,
 ): Promise<Response> {
-  if (
-    request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
-  ) {
-    return json({ error: "WebSocket upgrade required" }, 426);
+  const url = new URL(request.url);
+  const pathname = url.pathname;
+  const method = request.method.toUpperCase();
+
+  // Current user
+  if (pathname === "/api/me" && method === "GET") {
+    return json({
+      email: identity.email,
+      admin: isAdmin(identity.email, env),
+    });
   }
 
-  const service = await findService(
-    env,
-    slug,
-    identity.email,
-    admin
-  );
+  // Services available to this account
+  if (pathname === "/api/services" && method === "GET") {
+    const services = await listServices(env, identity);
 
-  if (!service) {
-    return json({ error: "Service unavailable" }, 404);
+    return json({
+      services: services.map((service) => ({
+        slug: service.slug,
+        name: service.name,
+        enabled: Boolean(service.enabled),
+        origin: service.origin,
+      })),
+    });
   }
 
-  const prefixes = await getAllowedPaths(service);
-
-  if (!prefixes) {
-    return json({ error: "Invalid service configuration" }, 500);
+  // All state-changing admin requests require same-origin.
+  if (method !== "GET" && !isSameOrigin(request)) {
+    return error("Invalid request origin", 403);
   }
 
-  const path = normalizeServicePath("/" + rest);
+  // Admin API
+  if (pathname.startsWith("/api/admin/")) {
+    if (!(await requireAdmin(identity, env))) {
+      return error("Administrator access required", 403);
+    }
 
-  if (!path || !pathAllowed(path, prefixes)) {
-    return json({ error: "Path not allowed" }, 403);
+    if (pathname === "/api/admin/services" && method === "POST") {
+      return adminCreateService(request, env);
+    }
+
+    if (pathname === "/api/admin/members" && method === "POST") {
+      return adminAddMember(request, env);
+    }
+
+    if (
+      pathname === "/api/admin/members/remove" &&
+      method === "POST"
+    ) {
+      return adminRemoveMember(request, env);
+    }
+
+    if (
+      pathname === "/api/admin/services/disable" &&
+      method === "POST"
+    ) {
+      return adminDisableService(request, env);
+    }
+
+    if (
+      pathname === "/api/admin/services/enable" &&
+      method === "POST"
+    ) {
+      return adminEnableService(request, env);
+    }
+
+    if (
+      pathname === "/api/admin/members/list" &&
+      method === "GET"
+    ) {
+      return adminListMembers(url, env);
+    }
+
+    if (
+      pathname === "/api/admin/events" &&
+      method === "GET"
+    ) {
+      return adminListEvents(url, env);
+    }
+
+    return notFound();
   }
 
-  const target = buildUpstreamUrl(
-    service.origin,
-    path,
-    new URL(request.url).search
-  );
+  // HTTP relay
+  const relayRoute = getProxyRoute(pathname);
 
-  if (!target) {
-    return json({ error: "Invalid upstream URL" }, 400);
+  if (relayRoute) {
+    const slug = validateSlug(relayRoute.slug);
+
+    if (!slug) return error("Invalid service slug", 400);
+
+    const service = await findService(env, slug);
+
+    if (!service || !(await canUseService(env, service, identity))) {
+      return error("Service not found or access denied", 403);
+    }
+
+    return relayHttp(
+      request,
+      env,
+      identity,
+      service,
+      relayRoute.servicePath,
+    );
   }
 
-  const result = await relayWebSocket(request, target);
+  // WebSocket relay
+  const websocketPrefix = "/api/ws/";
 
-  await writeAccessLog(env.DB, {
-    email: identity.email,
-    serviceSlug: slug,
-    method: "WEBSOCKET",
-    status: result.status
-  });
+  if (pathname.startsWith(websocketPrefix)) {
+    const remainder = pathname.slice(websocketPrefix.length);
+    const slashIndex = remainder.indexOf("/");
 
-  return result;
+    const rawSlug =
+      slashIndex === -1
+        ? remainder
+        : remainder.slice(0, slashIndex);
+
+    const servicePath =
+      slashIndex === -1
+        ? "/"
+        : remainder.slice(slashIndex);
+
+    const slug = validateSlug(rawSlug);
+
+    if (!slug) return error("Invalid service slug", 400);
+
+    const service = await findService(env, slug);
+
+    if (!service || !(await canUseService(env, service, identity))) {
+      return error("Service not found or access denied", 403);
+    }
+
+    const normalizedPath = normalizeProxyPath(servicePath);
+
+    if (!normalizedPath) {
+      return error("Invalid service path", 400);
+    }
+
+    const allowedPaths = parseAllowedPaths(service.allowed_paths);
+
+    if (
+      !allowedPaths ||
+      !pathIsAllowed(normalizedPath, allowedPaths)
+    ) {
+      return error("This path is not allowed for this service", 403);
+    }
+
+    const origin = validateOrigin(service.origin);
+
+    if (!origin) {
+      return error("Service origin configuration is invalid", 500);
+    }
+
+    const upstreamUrl = new URL(origin);
+    upstreamUrl.pathname = normalizedPath;
+    upstreamUrl.search = url.search;
+
+    try {
+      return await relayWebSocket(request, upstreamUrl);
+    } catch {
+      return error("WebSocket relay failed", 502);
+    }
+  }
+
+  return notFound();
 }
+
+// ------------------------------------------------------------
+// Main Worker
+// ------------------------------------------------------------
 
 export default {
   async fetch(
     request: Request,
-    env: Env
+    env: Env,
+    _ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    // Public health endpoint. It reveals no account or service data.
     if (url.pathname === "/health") {
-      return json({ ok: true });
-    }
-
-    if (!url.pathname.startsWith("/api/")) {
-      return env.ASSETS.fetch(request);
-    }
-
-    let identity: Identity;
-
-    try {
-      identity = await authenticate(request, env);
-    } catch {
       return json({
-        error: "Authentication required"
-      }, 401);
-    }
-
-    const admin = isAdmin(identity.email, env);
-
-    if (
-      request.method === "GET" &&
-      url.pathname === "/api/me"
-    ) {
-      return json({
-        email: identity.email,
-        admin
+        status: "ok",
+        service: "private-proxy",
       });
     }
 
-    if (
-      request.method === "GET" &&
-      url.pathname === "/api/services"
-    ) {
-      return json(
-        await listServices(env, identity.email, admin)
-      );
-    }
+    // API routes always require Cloudflare Access authentication.
+    if (url.pathname.startsWith("/api/")) {
+      const identity = await authenticate(request, env);
 
-    if (url.pathname.startsWith("/api/admin/")) {
-      if (!admin) {
-        return json({ error: "Admin only" }, 403);
+      if (!identity) {
+        return error("Authentication required", 401);
       }
 
-      return adminApi(request, env, url.pathname);
+      try {
+        return await handleApi(request, env, identity);
+      } catch {
+        return error("Internal server error", 500);
+      }
     }
 
-    const wsMatch = url.pathname.match(
-      /^\/api\/ws\/([a-z0-9-]{2,48})\/(.*)$/
-    );
+    // Static frontend assets.
+    // Protect the site itself with Cloudflare Access as well.
+    const identity = await authenticate(request, env);
 
-    if (wsMatch) {
-      return relayWs(
-        request,
-        env,
-        identity,
-        admin,
-        wsMatch[1],
-        wsMatch[2]
-      );
+    if (!identity) {
+      return new Response("Authentication required", {
+        status: 401,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Cache-Control": "no-store",
+        },
+      });
     }
 
-    const apiMatch = url.pathname.match(
-      /^\/api\/relay\/([a-z0-9-]{2,48})\/(.*)$/
-    );
-
-    if (apiMatch) {
-      return relayApi(
-        request,
-        env,
-        identity,
-        admin,
-        apiMatch[1],
-        apiMatch[2]
-      );
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed();
     }
 
-    return json({ error: "Not found" }, 404);
-  }
+    return env.ASSETS.fetch(request);
+  },
 };
